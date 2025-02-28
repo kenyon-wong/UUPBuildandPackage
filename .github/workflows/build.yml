@@ -1,0 +1,87 @@
+name: UUP Build and Package
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-iso:
+    name: Build Windows ISO
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup 7-Zip
+      shell: powershell
+      run: |
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri "https://www.7-zip.org/a/7z2409-x64.msi" -OutFile "$env:RUNNER_TEMP\7z.msi"
+        Start-Process msiexec -ArgumentList "/i $env:RUNNER_TEMP\7z.msi /quiet /qn /norestart" -Wait
+        # 通过环境文件全局添加 PATH
+        echo "PATH=$env:PATH;C:\Program Files\7-Zip" >> $env:GITHUB_ENV
+
+    - name: Extract source files
+      shell: powershell
+      run: |
+        7z x -o"$env:GITHUB_WORKSPACE\source" .\26100.1742_amd64_zh-cn_professional_e1d5e11a_convert_virtual.zip -y
+        # 输出解压目录结构用于验证
+        Get-ChildItem -Path "$env:GITHUB_WORKSPACE\source" -Recurse | Select-Object FullName
+
+    - name: Setup aria2
+      shell: powershell
+      run: |
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-WebRequest -Uri "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip" -OutFile aria2.zip
+        7z x aria2.zip -o"$env:GITHUB_WORKSPACE\aria2" -y
+        New-Item -ItemType Directory -Path "$env:GITHUB_WORKSPACE\source\files" -Force
+        Move-Item -Path "$env:GITHUB_WORKSPACE\aria2\aria2-1.37.0-win-64bit-build1\aria2c.exe" -Destination "$env:GITHUB_WORKSPACE\source\files"
+        # 通过环境文件全局添加 PATH
+        echo "PATH=$env:PATH;$env:GITHUB_WORKSPACE\source\files" >> $env:GITHUB_ENV
+
+    - name: Execute build script
+      shell: cmd
+      working-directory: ./source
+      run: |
+        uup_download_windows.cmd || exit /b 1
+      env:
+        CI: true
+        _ISO_ONLY: 1
+
+    - name: Find and Upload ISO
+      shell: powershell
+      run: |
+        # 限定搜索范围到 source 目录
+        $searchPath = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath "source"
+        $iso = Get-ChildItem -Path $searchPath -Recurse -Filter *.iso | Select-Object -First 1
+        
+        if (-not $iso) {
+          # 输出目录结构辅助排查
+          Get-ChildItem -Path $searchPath -Recurse | Select-Object FullName
+          Write-Error "::error::ISO file not found in $searchPath!"
+          exit 1
+        }
+        
+        Write-Output "Found ISO at: $($iso.FullName)"
+        echo "iso_path=$($iso.FullName)" >> $env:GITHUB_ENV
+
+        # 增强日志处理逻辑
+        $logDir = Join-Path -Path $env:GITHUB_WORKSPACE -ChildPath "source\logs"
+        if (Test-Path $logDir) {
+          Get-ChildItem -Path $logDir -Filter *.log | ForEach-Object {
+            Write-Output "Found log file: $($_.FullName)"
+            Get-Content $_.FullName -Tail 50 | ForEach-Object {
+              Write-Output "[LOG TAIL] $_"
+            }
+          }
+        } else {
+          Write-Warning "Log directory not found: $logDir"
+        }
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-iso
+        path: ${{ env.iso_path }}
+        retention-days: 3
